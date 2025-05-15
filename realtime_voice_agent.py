@@ -43,6 +43,7 @@ RATE        = 48_000                 # matches most laptop mics; Aura-2 optimal 
 CHUNK       = 8_000                  # 8000 / 48000 = ~167 ms chunks
 AUDIO_FMT   = pyaudio.paInt16
 SEND_EVERY = 180                     # chars per Speak  ≈ one sentence
+ALLOW_INTERRUPT = False             # ▶ set True to capture mic during TTS
 SILENCE     = b"\x00" * CHUNK * 2    # ➡ two bytes per sample (16-bit mono)
 LAT_BUDGET  = {"stt":300, "gpt":200, "tts":250}  # ms
 
@@ -54,7 +55,7 @@ token_q   : asyncio.Queue[str]   = asyncio.Queue()   # GPT → TTS
 
 p         = pyaudio.PyAudio()
 start_ts  = datetime.now()
-speaking  = threading.Event()          # set ↔ TTS audio is playing
+speaking  = threading.Event()          # set True ↔ TTS audio is playing
 last_tts_audio = asyncio.Queue(maxsize=1)  # ← timestamp bucket
 
 def log(msg:str):
@@ -64,20 +65,17 @@ def log(msg:str):
 
 def mic_cb(indata, frame_count, time_info, status):
     """
-    Called by PyAudio every `CHUNK` frames.
-    While Aura is speaking we still push *digital silence* into the STT queue
-    so Deepgram’s watchdog never fires.
-    """
-    if speaking.is_set():                       # avoid feedback → infinite loop
-        try:
-            audio_q.put_nowait(SILENCE)         # ➡ keep-alive
-        except asyncio.QueueFull:
-            pass
-        return (indata, pyaudio.paContinue)
+    Called by PyAudio every CHUNK frames.
+    While Aura is speaking we normally push *digital silence* into Deepgram
+    so its 10-second watchdog never fires.
 
-    # Non-blocking put
+    Flip ALLOW_INTERRUPT=True if you want to capture the user’s mic even while TTS is playing (headphones
+    recommended to avoid echo-loops).
+    
+    """
+    pay_load = indata if (ALLOW_INTERRUPT or not speaking.is_set()) else SILENCE  # avoid feedback → infinite loop
     try:
-        audio_q.put_nowait(indata)
+        audio_q.put_nowait(pay_load)                                             # ➡ keep-alive         
     except asyncio.QueueFull:
         pass
     return (indata, pyaudio.paContinue)
@@ -207,7 +205,7 @@ async def tts_sender(ws):
             speaking.set()                                   # block mic & GPT
         else:
             buffer.append(tok)
-            if sum(len(t) for t in buffer) >= SEND_EVERY:
+            if sum(len(t) for t in buffer) >= SEND_EVERY:    # micro-batch
                 await ws.send(json.dumps({"type": "Speak",
                                            "text": "".join(buffer)}))
                 buffer.clear()
@@ -215,25 +213,30 @@ async def tts_sender(ws):
 async def tts_receiver(ws):
     """
     • Plays PCM chunks to the Speaker/user as they arrive
-    • Logs when the first audio chunk of each turn arrives
+    • Logs '🎧 Aura audio started' when the first audio chunk of each turn arrives
     • Updates last-audio timestamp
-    • Clears `speaking` if we haven’t heard audio for 600 ms - `silence_timeout`
+    • Clears `speaking` if we haven’t heard audio for 1000 ms (1 sec) - `silence_timeout`
+    • When playback ends -> speaking.clear() AND cue the user
+
     """
     spk = Speaker(); spk.start()
 
-    silence_timeout = 0.6                               # seconds of silence (without audio) ⇒ playback finished
+    silence_timeout = 1.0                               # seconds of silence (without audio) ⇒ playback finished
     last_audio_ts   = time.perf_counter()
-    first_audio     = False                             # will become True once we log the start
+    first_audio     = False                             # becomes True when first PCM arrives
 
-    # --- watchdog that fires when playback seems to be over -------------
+    # --- watchdog that fires only *after* first_audio is True (when playback seems to be over) -------------
     async def watchdog():
         nonlocal first_audio
         while True:
             await asyncio.sleep(0.1)
+            if not first_audio:
+                continue                                 # wait until we’ve heard audio
             if speaking.is_set() and time.perf_counter() - last_audio_ts > silence_timeout:
                 speaking.clear()
-                first_audio = False               # reset for next turn
+                first_audio = False                        # reset for next turn
                 log("🌊 Aura finished playback (watch-dog)")
+                log("🎤  You can speak now …\n")           # <-- user prompt
 
     wd_task = asyncio.create_task(watchdog())
 
@@ -250,6 +253,7 @@ async def tts_receiver(ws):
                     speaking.clear()
                     first_audio = False                     # reset for next turn
                     log("🌊 Aura finished playback")
+                    log("🎤  You can speak now …\n")           # <-- user prompt
                 elif evt.get("type") == "Error":
                     log(f"🔴 Aura error: {evt}")
                 continue
