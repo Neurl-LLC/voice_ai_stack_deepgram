@@ -1,4 +1,4 @@
-# ⚡ Real-Time Voice Agent – <1 s Round-Trip
+# ⚡ Real-Time Voice Agent – <3 s Round-Trip
 
 Mic ▶ **Deepgram Nova-3 (STT)** ▶ **GPT-4o-mini (LLM)** ▶ **Deepgram Aura-2 (TTS)** ▶ Speaker
 
@@ -6,7 +6,7 @@ Mic ▶ **Deepgram Nova-3 (STT)** ▶ **GPT-4o-mini (LLM)** ▶ **Deepgram Aura-
 <img src="https://raw.githubusercontent.com/Neurl/deepgram/realtime-voice-agent/main/.github/flow.svg" width="640">
 </p>
 
-> **Goal:** Keep the 95-th percentile end-to-end latency **below 1 second** – from the moment a user finishes speaking until the first audio sample of the assistant’s reply is heard.
+> **Goal:** Keep the 95-th percentile end-to-end latency **below 3 second** – from the moment a user finishes speaking until the first audio sample of the assistant’s reply is heard.
 
 ---
 
