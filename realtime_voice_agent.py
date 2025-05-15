@@ -37,7 +37,8 @@ if not (DG_API and OA_API):
 STT_MODEL   = "nova-3"
 TTS_MODEL   = "aura-2-thalia-en"
 GPT_MODEL   = "gpt-4o-mini"          # streaming
-SYS_PROMPT =  "You are a succinct, helpful assistant. Reply conversationally." # system prompt keeps output short / ready for TTS
+SYS_PROMPT =  "You are a succinct, helpful assistant. Respond in ≤6 words." \
+              "Keep answers short, direct, friendly."          # system prompt keeps output short / ready for TTS
 
 RATE        = 48_000                 # matches most laptop mics; Aura-2 optimal rate (also works at 16 k)
 CHUNK       = 8_000                  # 8000 / 48000 = ~167 ms chunks
@@ -56,6 +57,7 @@ token_q   : asyncio.Queue[str]   = asyncio.Queue()   # GPT → TTS
 p         = pyaudio.PyAudio()
 start_ts  = datetime.now()
 speaking  = threading.Event()          # set True ↔ TTS audio is playing
+rtt_start_ts: float | None = None      # ⏱ timestamp of current turn
 last_tts_audio = asyncio.Queue(maxsize=1)  # ← timestamp bucket
 
 def log(msg:str):
@@ -118,6 +120,10 @@ async def stt_receiver(ws):
     async for raw in ws:
         text = extract_final(json.loads(raw))
         if text:
+            # mark start of round-trip
+            global rtt_start_ts
+            rtt_start_ts = time.perf_counter()
+
             await utter_q.put(text)
 
 async def run_stt():
@@ -237,6 +243,14 @@ async def tts_receiver(ws):
         speaking.clear()
         first_audio = False                  # reset for next turn
         log("🌊 Aura finishing playback...")
+
+        # ---------- RTT metric ----------
+        global rtt_start_ts
+        if rtt_start_ts:
+            rtt = int((time.perf_counter() - rtt_start_ts) * 1000)
+            log(f"⏱  End-to-end RTT: {rtt} ms")
+            rtt_start_ts = None              # ready for next turn
+        
         log("🎤  You can speak now …\n")    # <-- user prompt
 
     # --- watchdog that fires only *after* first_audio is True (when playback seems to be over) -------------
