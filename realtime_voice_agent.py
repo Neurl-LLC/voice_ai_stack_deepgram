@@ -12,13 +12,17 @@ Round-trip P95 target  ≤ 800 ms
 Author: <you>
 """
 
-import asyncio, json, os, queue, sys, threading, time
+import os, sys, json, queue, asyncio, threading, time
 from datetime import datetime
-
-import websockets
-import pyaudio
-from openai import OpenAI
+import pyaudio, websockets, openai
 from dotenv import load_dotenv
+
+from deepgram import (
+    DeepgramClient,
+    PrerecordedOptions,
+    FileSource,
+)
+
 
 # ------------ 0. Config -----------------------------------------------------------------
 
@@ -29,30 +33,43 @@ OA_API = os.getenv("OPENAI_API_KEY")
 if not (DG_API and OA_API):
     print("❌  Set DEEPGRAM_API_KEY & OPENAI_API_KEY in .env"); sys.exit(1)
 
-STT_MODEL   = "nova-3-medical"
+# ─────────────── CONSTANTS ───────────────────────────────────────────────────────────────
+STT_MODEL   = "nova-3"
 TTS_MODEL   = "aura-2-thalia-en"
 GPT_MODEL   = "gpt-4o-mini"          # streaming
-RATE        = 48_000                 # Aura-2 optimal rate (also works at 16 k)
-CHUNK       = 8_000                  # 8000 / 48000 = 166 ms chunks
+SYS_PROMPT =  "You are a succinct, helpful assistant. Reply conversationally." # system prompt keeps output short / ready for TTS
+
+RATE        = 44_100                 # matches most laptop mics; Aura-2 optimal rate (also works at 16 k)
+CHUNK       = 8_000                  # 8000 / 44100 = 180 ms chunks
 AUDIO_FMT   = pyaudio.paInt16
+SEND_EVERY = 180                     # chars per Speak  ≈ one sentence
 LAT_BUDGET  = {"stt":300, "gpt":200, "tts":250}  # ms
 
 # ------------ 1. Globals / helpers ------------------------------------------------------
 
-audio_q   : asyncio.Queue[bytes] = asyncio.Queue()
+audio_q   : asyncio.Queue[bytes] = asyncio.Queue(maxsize=10)
 utter_q   : asyncio.Queue[str]   = asyncio.Queue()   # STT → GPT
 token_q   : asyncio.Queue[str]   = asyncio.Queue()   # GPT → TTS
+
+
 p         = pyaudio.PyAudio()
 start_ts  = datetime.now()
+speaking  = threading.Event()          # set ↔ TTS audio is playing
 
-def log(msg:str): print(f"[{(datetime.now()-start_ts).total_seconds():6.2f}s] {msg}")
+def log(msg:str):
+    print(f"[{(datetime.now()-start_ts).total_seconds():6.2f}s] {msg}")
 
-# ------------ 2. Microphone task --------------------------------------------------------
+# ------------ 2. Microphone task (drops audio while speaker is talking) --------------------------------------------------------
 
 def mic_cb(indata, frame_count, time_info, status):
+    if speaking.is_set():                       # avoid feedback → infinite loop
+        return (indata, pyaudio.paContinue)
+
     # Non-blocking put
-    try: audio_q.put_nowait(indata)
-    except asyncio.QueueFull: pass
+    try:
+        audio_q.put_nowait(indata)
+    except asyncio.QueueFull:
+        pass
     return (indata, pyaudio.paContinue)
 
 async def mic_task():
@@ -62,11 +79,17 @@ async def mic_task():
     stream.start_stream()
     log("🎙  Mic streaming …  Ctrl-C to stop")
     try:
-        while stream.is_active(): await asyncio.sleep(0.1)
+        while stream.is_active():
+            await asyncio.sleep(0.1)
     finally:
         stream.stop_stream(); stream.close(); p.terminate()
 
 # ------------ 3. Deepgram STT tasks -----------------------------------------------------
+def extract_final(msg: dict) -> str | None:
+    if not msg.get("is_final"):
+        return None
+    alt = msg.get("channel", {}).get("alternatives", [{}])[0]
+    return alt.get("transcript", "").strip()
 
 async def stt_sender(ws):
     """Send mic PCM -> Deepgram"""
@@ -74,16 +97,10 @@ async def stt_sender(ws):
         chunk = await audio_q.get()
         await ws.send(chunk)
 
-def extract_final_transcript(msg:dict) -> str|None:
-    if not msg.get("is_final"): return None
-    alt = msg.get("channel",{}).get("alternatives",[{}])[0]
-    return alt.get("transcript","").strip()
-
 async def stt_receiver(ws):
     """Receive transcripts; push completed utterances to GPT queue"""
     async for raw in ws:
-        res = json.loads(raw)
-        text = extract_final_transcript(res)
+        text = extract_final(json.loads(raw))
         if text:
             await utter_q.put(text)
 
@@ -96,9 +113,9 @@ async def run_stt():
         log("🟢 STT WebSocket open")
         await asyncio.gather(stt_sender(ws), stt_receiver(ws))
 
-# ------------ 4. GPT-4o streaming task --------------------------------------------------
+# ------------ 4. GPT-4o streaming task/worker (utter_q ➜ token_q  [+ [[FLUSH]]) -----------
 
-oa_client = OpenAI(api_key=OA_API)
+oa_client = openai.OpenAI(api_key=OA_API)
 
 async def gpt_worker():
     """For each utterance -> stream GPT response tokens -> token_q"""
@@ -109,23 +126,27 @@ async def gpt_worker():
         t0 = time.perf_counter()
         stream = oa_client.chat.completions.create(
             model=GPT_MODEL,
-            messages=[{"role":"user","content":user_utt}],
+            messages=[{"role":"system","content":SYS_PROMPT},
+                      {"role":"user","content":user_utt}],
             stream=True,
+            temperature=0.4
         )
+
         first_tok = True
         for chunk in stream:
-            if chunk.choices[0].delta.content is None: continue
             tok = chunk.choices[0].delta.content
+            if tok is None:
+                continue
             if first_tok:
-                dt=int((time.perf_counter()-t0)*1000)
-                log(f"⚡ GPT first token {dt} ms")
-                first_tok=False
+                log(f"⚡ GPT first token {int((time.perf_counter()-t0)*1000)} ms")
+                first_tok = False
             await token_q.put(tok)
         # mark end
-        await token_q.put("[[FLUSH]]")
+        await token_q.put("[[FLUSH]]")          # sentinel
 
-# ------------ 5. Deepgram Aura-2 TTS / Speaker -----------------------------------------
+# ------------ 5. Deepgram Aura-2 TTS and playback / Speaker (WebSocket helper – runs in thread) -----------------------------------------
 
+# One async task handling *both* directions
 class Speaker:
     """Small blocking playback thread with a queue of PCM bytes"""
     def __init__(self, rate=RATE, chunk=CHUNK):
