@@ -4,10 +4,10 @@ Real-Time Voice Agent
 
 Mic ► Deepgram STT ► GPT-4o streaming ► Deepgram Aura-2 streaming ► Speaker
 
-Round-trip P95 target  ≤ 800 ms
+Round-trip P95 target  ≤ 1,000 ms
   • STT  ≤ 300 ms        (Deepgram Nova-3 streaming)
   • GPT  ≤ 200 ms        (first token latency – we overlap synthesis)
-  • TTS  ≤ 250 ms TTFB   (Aura-2 WebSocket, 48 kHz linear16)
+  • TTS  ≤ 250 ms TTFB   (Aura-2 WebSocket, 44.1 kHz linear16)
 
 Author: <you>
 """
@@ -24,7 +24,7 @@ from deepgram import (
 )
 
 
-# ------------ 0. Config -----------------------------------------------------------------
+# ------------ 0. Config - ENV / KEYS -----------------------------------------------------------------
 
 load_dotenv()
 
@@ -39,22 +39,23 @@ TTS_MODEL   = "aura-2-thalia-en"
 GPT_MODEL   = "gpt-4o-mini"          # streaming
 SYS_PROMPT =  "You are a succinct, helpful assistant. Reply conversationally." # system prompt keeps output short / ready for TTS
 
-RATE        = 44_100                 # matches most laptop mics; Aura-2 optimal rate (also works at 16 k)
-CHUNK       = 8_000                  # 8000 / 44100 = 180 ms chunks
+RATE        = 48_000                 # matches most laptop mics; Aura-2 optimal rate (also works at 16 k)
+CHUNK       = 8_000                  # 8000 / 48000 = ~167 ms chunks
 AUDIO_FMT   = pyaudio.paInt16
 SEND_EVERY = 180                     # chars per Speak  ≈ one sentence
+SILENCE     = b"\x00" * CHUNK * 2    # ➡ two bytes per sample (16-bit mono)
 LAT_BUDGET  = {"stt":300, "gpt":200, "tts":250}  # ms
 
-# ------------ 1. Globals / helpers ------------------------------------------------------
+# ------------ 1. GLOBAL CO-ORDINATION PRIMITIVES / helpers ------------------------------------------------------
 
-audio_q   : asyncio.Queue[bytes] = asyncio.Queue(maxsize=10)
+audio_q   : asyncio.Queue[bytes] = asyncio.Queue(maxsize=200)
 utter_q   : asyncio.Queue[str]   = asyncio.Queue()   # STT → GPT
 token_q   : asyncio.Queue[str]   = asyncio.Queue()   # GPT → TTS
-
 
 p         = pyaudio.PyAudio()
 start_ts  = datetime.now()
 speaking  = threading.Event()          # set ↔ TTS audio is playing
+last_tts_audio = asyncio.Queue(maxsize=1)  # ← timestamp bucket
 
 def log(msg:str):
     print(f"[{(datetime.now()-start_ts).total_seconds():6.2f}s] {msg}")
@@ -62,7 +63,16 @@ def log(msg:str):
 # ------------ 2. Microphone task (drops audio while speaker is talking) --------------------------------------------------------
 
 def mic_cb(indata, frame_count, time_info, status):
+    """
+    Called by PyAudio every `CHUNK` frames.
+    While Aura is speaking we still push *digital silence* into the STT queue
+    so Deepgram’s watchdog never fires.
+    """
     if speaking.is_set():                       # avoid feedback → infinite loop
+        try:
+            audio_q.put_nowait(SILENCE)         # ➡ keep-alive
+        except asyncio.QueueFull:
+            pass
         return (indata, pyaudio.paContinue)
 
     # Non-blocking put
@@ -91,11 +101,19 @@ def extract_final(msg: dict) -> str | None:
     alt = msg.get("channel", {}).get("alternatives", [{}])[0]
     return alt.get("transcript", "").strip()
 
+# ---------------------------------------------------------------------
+# 3.1  STT sender     (audio_q ➜ Nova-3)
+# ---------------------------------------------------------------------
+
 async def stt_sender(ws):
     """Send mic PCM -> Deepgram"""
     while True:
         chunk = await audio_q.get()
         await ws.send(chunk)
+
+# ---------------------------------------------------------------------
+# 3.2  STT receiver   (Nova-3 ➜ utter_q)
+# ---------------------------------------------------------------------
 
 async def stt_receiver(ws):
     """Receive transcripts; push completed utterances to GPT queue"""
@@ -144,56 +162,109 @@ async def gpt_worker():
         # mark end
         await token_q.put("[[FLUSH]]")          # sentinel
 
-# ------------ 5. Deepgram Aura-2 TTS and playback / Speaker (WebSocket helper – runs in thread) -----------------------------------------
+# ------------ 5. Deepgram Aura-2 TTS and playback / Speaker (WebSocket helper – runs in thread) ------
 
 # One async task handling *both* directions
 class Speaker:
-    """Small blocking playback thread with a queue of PCM bytes"""
+    """Plays PCM bytes from a Queue in a background thread."""
     def __init__(self, rate=RATE, chunk=CHUNK):
-        self.q:queue.Queue[bytes]=queue.Queue()
-        self.exit=threading.Event()
-        self.stream=p.open(format=AUDIO_FMT, channels=1, rate=rate,
-                           output=True, frames_per_buffer=chunk)
-        self.th=threading.Thread(target=self.run,daemon=True)
+        self.q: queue.Queue[bytes] = queue.Queue()
+        self.exit = threading.Event()
+        self.stream = p.open(format=AUDIO_FMT, channels=1, rate=rate,
+                             output=True, frames_per_buffer=chunk)
+        self.th = threading.Thread(target=self.run, daemon=True)
+
     def start(self): self.th.start()
-    def stop(self): self.exit.set(); self.th.join(); self.stream.close()
-    def play(self,data:bytes): self.q.put(data)
+    def stop(self):
+        self.exit.set(); self.th.join(); self.stream.close()
+
+    def play(self, data: bytes):
+        self.q.put(data)
+
     def run(self):
         while not self.exit.is_set():
-            try: self.stream.write(self.q.get(timeout=0.1))
-            except queue.Empty: pass
+            try:
+                self.stream.write(self.q.get(timeout=0.1))
+            except queue.Empty:
+                pass
 
 async def tts_sender(ws):
     """Read tokens from GPT and send Speak messages"""
-    buffer=[]
+    buffer: list[str] = []
     while True:
-        tok=await token_q.get()
-        if tok=="[[FLUSH]]":
-            if buffer:
-                await ws.send(json.dumps({"type":"Speak","text":"".join(buffer)}))
-                buffer=[]
-            await ws.send(json.dumps({"type":"Flush"}))
+        tok = await token_q.get()
+
+        # Hold off sending new requests while Aura is still speaking
+        while speaking.is_set():
+            await asyncio.sleep(0.05)
+
+        if tok == "[[FLUSH]]":
+            if buffer:                                       # send last batch
+                await ws.send(json.dumps({"type": "Speak",
+                                           "text": "".join(buffer)}))
+                buffer.clear()
+            await ws.send(json.dumps({"type": "Flush"}))
+            speaking.set()                                   # block mic & GPT
         else:
             buffer.append(tok)
-            # micro-batching: send every ~20 chars
-            if sum(len(t) for t in buffer)>=20:
-                await ws.send(json.dumps({"type":"Speak","text":"".join(buffer)}))
-                buffer=[]
+            if sum(len(t) for t in buffer) >= SEND_EVERY:
+                await ws.send(json.dumps({"type": "Speak",
+                                           "text": "".join(buffer)}))
+                buffer.clear()
 
 async def tts_receiver(ws):
-    speaker=Speaker(); speaker.start()
-    first=False; t0=0
+    """
+    • Plays PCM chunks to the Speaker/user as they arrive
+    • Logs when the first audio chunk of each turn arrives
+    • Updates last-audio timestamp
+    • Clears `speaking` if we haven’t heard audio for 600 ms - `silence_timeout`
+    """
+    spk = Speaker(); spk.start()
+
+    silence_timeout = 0.6                               # seconds of silence (without audio) ⇒ playback finished
+    last_audio_ts   = time.perf_counter()
+    first_audio     = False                             # will become True once we log the start
+
+    # --- watchdog that fires when playback seems to be over -------------
+    async def watchdog():
+        nonlocal first_audio
+        while True:
+            await asyncio.sleep(0.1)
+            if speaking.is_set() and time.perf_counter() - last_audio_ts > silence_timeout:
+                speaking.clear()
+                first_audio = False               # reset for next turn
+                log("🌊 Aura finished playback (watch-dog)")
+
+    wd_task = asyncio.create_task(watchdog())
+
     try:
         async for msg in ws:
-            if isinstance(msg,str):
-                continue   # JSON control; ignore
-            elif isinstance(msg,bytes):
-                if not first:
-                    t0=time.perf_counter(); first=True
+            # ───────── control frames (JSON) ─────────
+            if isinstance(msg, str):
+                try:
+                    evt = json.loads(msg)
+                except json.JSONDecodeError:
+                    continue
+
+                if evt.get("type") == "PlaybackFinished":   # some voices still send it
+                    speaking.clear()
+                    first_audio = False                     # reset for next turn
+                    log("🌊 Aura finished playback")
+                elif evt.get("type") == "Error":
+                    log(f"🔴 Aura error: {evt}")
+                continue
+
+            # ───────── audio frames (bytes) ──────────
+            elif isinstance(msg, bytes):                    # audio payload
+                if not first_audio:
                     log("🎧 Aura audio started")
-                speaker.play(msg)
+                    first_audio = True
+                last_audio_ts = time.perf_counter()        # ❤  update timestamp
+                spk.play(msg)                             # first audio byte → we already log elsewhere
+
     finally:
-        speaker.stop()
+        wd_task.cancel()
+        spk.stop()
 
 async def run_tts():
     url=(f"wss://api.deepgram.com/v1/speak?"
@@ -203,10 +274,9 @@ async def run_tts():
         log("🟢 TTS WebSocket open")
         await asyncio.gather(tts_sender(ws), tts_receiver(ws))
 
-# ------------ 6. Orchestrator -----------------------------------------------------------
-
+# ------------ 6. Main Orchestrator -----------------------------------------------------------
 async def main():
-    tasks=[
+    tasks = [
         asyncio.create_task(mic_task()),
         asyncio.create_task(run_stt()),
         asyncio.create_task(gpt_worker()),
@@ -216,7 +286,13 @@ async def main():
         await asyncio.gather(*tasks)
     except KeyboardInterrupt:
         log("🛑 Ctrl-C, shutting down…")
-        for t in tasks: t.cancel()
+        for t in tasks:
+            t.cancel()
 
 if __name__=="__main__":
-    asyncio.run(main())
+    print("🔗  Mic → Nova-3 → GPT-4o → Aura-2 – starting …")
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
+    print("👋  Goodbye")
