@@ -213,35 +213,59 @@ async def tts_sender(ws):
 async def tts_receiver(ws):
     """
     • Plays PCM chunks to the Speaker/user as they arrive
+    • Detects when Aura finished by one of three conditions
+        1. we get the explicit `PlaybackFinished` control frame  ➜ reliable
+        2. OR   the PCM queue drains & stays empty for ≥ 250 ms  ➜ fast
+        3. OR   we’ve heard no audio bytes for ≥ `silence_timeout_max` (safety net)
+    • When playback ends ⇒ speaking.clear()  & prompt user
     • Logs '🎧 Aura audio started' when the first audio chunk of each turn arrives
     • Updates last-audio timestamp
-    • Clears `speaking` if we haven’t heard audio for 1000 ms (1 sec) - `silence_timeout`
-    • When playback ends -> speaking.clear() AND cue the user
 
     """
     spk = Speaker(); spk.start()
 
-    silence_timeout = 1.0                               # seconds of silence (without audio) ⇒ playback finished
+    silence_timeout_max = 3.0                      # recommending 1000 ms but 3000ms of perceived delay before ... 
+                                                  # ... the user can speak again is a hard ceiling  (never wait longer than this)
+    queue_empty_wait      = 0.25                  # queue drained this long → very likely done
+
     last_audio_ts   = time.perf_counter()
-    first_audio     = False                             # becomes True when first PCM arrives
+    first_audio     = False                      # becomes True when first PCM arrives
+
+   # helper func
+    def finished_playback():
+        nonlocal first_audio
+        speaking.clear()
+        first_audio = False                  # reset for next turn
+        log("🌊 Aura finishing playback...")
+        log("🎤  You can speak now …\n")    # <-- user prompt
 
     # --- watchdog that fires only *after* first_audio is True (when playback seems to be over) -------------
     async def watchdog():
-        nonlocal first_audio
         while True:
-            await asyncio.sleep(0.1)
-            if not first_audio:
-                continue                                 # wait until we’ve heard audio
-            if speaking.is_set() and time.perf_counter() - last_audio_ts > silence_timeout:
-                speaking.clear()
-                first_audio = False                        # reset for next turn
-                log("🌊 Aura finished playback (watch-dog)")
-                log("🎤  You can speak now …\n")           # <-- user prompt
+            await asyncio.sleep(0.05)
+
+            if not first_audio or not speaking.is_set():
+                continue                    # no active playback, nothing to test
+
+            now = time.perf_counter()
+
+            # (1) queue completely played & quiet for queue_empty_wait --------------
+            try:
+                spk.q.queue[0]              # throws IndexError if empty
+            except IndexError:
+                if now - last_audio_ts > queue_empty_wait:
+                    finished_playback()
+                    continue
+
+            # (2) absolute ceiling -----------------------------------------------
+            if now - last_audio_ts > silence_timeout_max:
+                finished_playback()
 
     wd_task = asyncio.create_task(watchdog())
 
     try:
         async for msg in ws:
+
             # ───────── control frames (JSON) ─────────
             if isinstance(msg, str):
                 try:
@@ -249,21 +273,19 @@ async def tts_receiver(ws):
                 except json.JSONDecodeError:
                     continue
 
-                if evt.get("type") == "PlaybackFinished":   # some voices still send it
-                    speaking.clear()
-                    first_audio = False                     # reset for next turn
-                    log("🌊 Aura finished playback")
-                    log("🎤  You can speak now …\n")           # <-- user prompt
+                if evt.get("type") == "PlaybackFinished":    # some voices still send it
+                    finished_playback()
                 elif evt.get("type") == "Error":
                     log(f"🔴 Aura error: {evt}")
                 continue
 
             # ───────── audio frames (bytes) ──────────
-            elif isinstance(msg, bytes):                    # audio payload
+            if isinstance(msg, bytes):                     # audio payload
                 if not first_audio:
                     log("🎧 Aura audio started")
                     first_audio = True
-                last_audio_ts = time.perf_counter()        # ❤  update timestamp
+                    speaking.set()
+                last_audio_ts = time.perf_counter()       # ❤  update timestamp
                 spk.play(msg)                             # first audio byte → we already log elsewhere
 
     finally:
