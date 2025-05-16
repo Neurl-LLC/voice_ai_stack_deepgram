@@ -3,7 +3,7 @@
 Mic ▶ **Deepgram Nova-3 (STT)** ▶ **GPT-4o-mini (LLM)** ▶ **Deepgram Aura-2 (TTS)** ▶ Speaker
 
 <p align="center">
-<img src="https://raw.githubusercontent.com/Neurl/deepgram/realtime-voice-agent/main/.github/flow.svg" width="640">
+<img src="https://raw.githubusercontent.com/Neurl-LLC/voice_ai_stack_deepgram/refs/heads/main/neurl_creators_community.png" width="640">
 </p>
 
 > **Goal:** Keep the 95-th percentile end-to-end latency **below 3 second** – from the moment a user finishes speaking until the first audio sample of the assistant’s reply is heard.
@@ -51,8 +51,8 @@ Optional tweaks (inside the script):
 | Constant | Default | Notes |
 | ----- | ----- | ----- |
 | `RATE` | 48000 | Use 16000 for lower bandwidth |
-| `CHUNK` | 2000 | Audio frames sent per WS message (\~42 ms) |
-| `SEND_EVERY` | 20 | Characters before we flush to Aura |
+| `CHUNK` | 8000 | Audio frames sent per WS message (\~42 ms) |
+| `SEND_EVERY` | 180 | Characters before we flush to Aura |
 | `ALLOW_INTERRUPT` | `False` | Set `True` to capture mic during TTS |
 
 ---
